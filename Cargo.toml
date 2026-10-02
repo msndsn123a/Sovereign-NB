@@ -1,0 +1,23 @@
+[package]
+name = "neural_box_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+uefi = { version = "0.31", default-features = false }
+uefi-raw = { version = "0.7", default-features = false }
+
+[features]
+default = []
+host-ipc = []
+
+[profile.dev]
+panic = "abort"
+opt-level = 3
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 3
+codegen-units = 1
+strip = false

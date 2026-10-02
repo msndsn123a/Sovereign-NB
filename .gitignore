@@ -1,0 +1,14 @@
+/target/
+**/target/
+/dist/*.img
+/dist/*.bin
+/dist/*.exe
+/dist/*.pdb
+/dist/*.pt
+/dist/*.json
+*.log
+__pycache__/
+*.pyc
+.vscode/
+/esp/EFI/BOOT/BOOTX64.EFI
+/esp/NvVars
