@@ -17,13 +17,21 @@ pub const WEIGHT_POS: u8 = 0b01;
 pub const WEIGHT_NEG: u8 = 0b11;
 
 pub const NEUR_MAGIC: u32 = 0x4E45_5552;
-pub const NEUR_HEADER_SIZE: usize = 16;
+pub const NEUR_BASE_HEADER_SIZE: usize = 16;
+pub const NEUR_SIGNATURE_SIZE: usize = 64;
+pub const NEUR_HEADER_SIZE: usize = NEUR_BASE_HEADER_SIZE + NEUR_SIGNATURE_SIZE;
 pub const NEUR_INPUT_DIM: u32 = 64;
 pub const NEUR_HIDDEN_DIM: u8 = 32;
 pub const NEUR_OUTPUT_DIM: u16 = 16;
 pub const NEUR_ATTN_DIM: u8 = 16;
 pub const NEUR_MODEL_MLP: u8 = 0;
 pub const NEUR_MODEL_CAUSAL_LINEAR_ATTENTION: u8 = 1;
+pub const NEUR_QUANT_POT: u8 = 1;
+pub const NEUR_FLAG_POT: u8 = 0x40;
+pub const NEUR_FLAG_BLOCK_SPARSE: u8 = 0x40;
+pub const NEUR_FLAG_MULTI_STREAM: u8 = 0x80;
+pub const NEUR_FLAG_ACTIVATION_LUT: u16 = 0x8000;
+pub const NEUR_ATTENTION_POT_PAYLOAD_BYTES: usize = 1664;
 pub const NEUR_LAYER1_BYTES: usize = NEUR_HIDDEN_DIM as usize * 16;
 pub const NEUR_LAYER2_BYTES: usize = NEUR_OUTPUT_DIM as usize * 8;
 pub const NEUR_ATTENTION_QK_BYTES: usize = NEUR_INPUT_DIM as usize * NEUR_ATTN_DIM as usize / 4;
@@ -32,6 +40,8 @@ pub const NEUR_ATTENTION_O_BYTES: usize = NEUR_OUTPUT_DIM as usize * NEUR_ATTN_D
 pub const NEUR_ATTENTION_PAYLOAD_BYTES: usize =
     NEUR_ATTENTION_QK_BYTES * 3 + NEUR_ATTENTION_O_BYTES;
 pub const NEUR_MLP_PAYLOAD_BYTES: usize = NEUR_LAYER1_BYTES + NEUR_LAYER2_BYTES;
+pub const NEUR_MLP_BLOCK_MASK_BYTES: usize = NEUR_HIDDEN_DIM as usize + NEUR_OUTPUT_DIM as usize;
+pub const NEUR_MLP_SPARSE_PAYLOAD_BYTES: usize = NEUR_MLP_PAYLOAD_BYTES + NEUR_MLP_BLOCK_MASK_BYTES;
 pub const NEUR_MLP_SHARD_SIZE: usize = NEUR_HEADER_SIZE + NEUR_MLP_PAYLOAD_BYTES;
 pub const NEUR_ATTENTION_SHARD_SIZE: usize = NEUR_HEADER_SIZE + NEUR_ATTENTION_PAYLOAD_BYTES;
 pub const NEUR_QUANT_TERNARY: u8 = 0;
@@ -45,6 +55,10 @@ pub struct NeurHeader {
     pub quant_type: u8,
     pub model_type: u8,
     pub attn_dim: u16,
+    pub multi_stream: bool,
+    pub pot_scale: u8,
+    pub block_sparse: bool,
+    pub activation_lut: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,12 +72,14 @@ pub enum NeurHeaderError {
     NonzeroReservedByte,
 }
 
-/// Parses and validates the fixed 16-byte NEUR header.
+/// Parses and validates the fixed 16-byte NEUR metadata prefix.
 ///
 /// Layout: magic[0..4], version[4..8], input_dim[8..12], model_type[12],
-/// output_dim[13..15] little-endian, hidden_dim[15].
+/// output_dim[13..15] little-endian (upper bits carry PoT scale and LUT flag),
+/// and dimension/flags in byte 15. Feature flags are authenticated as part of
+/// the existing signed 16-byte prefix.
 pub fn parse_neur_header(data: &[u8]) -> Result<NeurHeader, NeurHeaderError> {
-    if data.len() < NEUR_HEADER_SIZE {
+    if data.len() < NEUR_BASE_HEADER_SIZE {
         return Err(NeurHeaderError::Truncated);
     }
 
@@ -75,8 +91,18 @@ pub fn parse_neur_header(data: &[u8]) -> Result<NeurHeader, NeurHeaderError> {
     let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
     let input_dim = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
     let model_type = data[12];
-    let output_dim = u16::from_le_bytes([data[13], data[14]]);
-    let hidden_or_attn_dim = data[15];
+    let output_meta = u16::from_le_bytes([data[13], data[14]]);
+    let output_dim = output_meta & 0x0FFF;
+    let pot_scale = ((output_meta >> 12) & 0x07) as u8;
+    let activation_lut = output_meta & NEUR_FLAG_ACTIVATION_LUT != 0;
+    let header_flags = data[15];
+    let hidden_or_attn_dim = header_flags & 0x3F;
+    let multi_stream = header_flags & NEUR_FLAG_MULTI_STREAM != 0;
+    let is_attention = model_type == NEUR_MODEL_CAUSAL_LINEAR_ATTENTION;
+    let is_mlp = model_type == NEUR_MODEL_MLP;
+    let feature_flag = header_flags & NEUR_FLAG_POT != 0;
+    let quant_type = u8::from(is_attention && feature_flag);
+    let block_sparse = is_mlp && feature_flag;
 
     if input_dim != NEUR_INPUT_DIM {
         return Err(NeurHeaderError::UnsupportedInputDimension);
@@ -84,11 +110,21 @@ pub fn parse_neur_header(data: &[u8]) -> Result<NeurHeader, NeurHeaderError> {
     if output_dim != NEUR_OUTPUT_DIM {
         return Err(NeurHeaderError::InvalidOutputDimension);
     }
+    if pot_scale > 6 || (quant_type == NEUR_QUANT_TERNARY && pot_scale != 0) {
+        return Err(NeurHeaderError::UnsupportedQuantization);
+    }
 
-    let is_attention = model_type == NEUR_MODEL_CAUSAL_LINEAR_ATTENTION;
-    let is_mlp = model_type == NEUR_MODEL_MLP;
     if !(is_attention || is_mlp) {
         return Err(NeurHeaderError::UnsupportedQuantization);
+    }
+    if quant_type == NEUR_QUANT_POT && !is_attention {
+        return Err(NeurHeaderError::UnsupportedQuantization);
+    }
+    if multi_stream && !is_attention {
+        return Err(NeurHeaderError::NonzeroReservedByte);
+    }
+    if activation_lut && !is_mlp {
+        return Err(NeurHeaderError::NonzeroReservedByte);
     }
 
     let hidden_dim = if is_attention {
@@ -108,13 +144,17 @@ pub fn parse_neur_header(data: &[u8]) -> Result<NeurHeader, NeurHeaderError> {
         input_dim,
         hidden_dim,
         output_dim,
-        quant_type: NEUR_QUANT_TERNARY,
+        quant_type,
         model_type,
         attn_dim: if is_attention {
             hidden_or_attn_dim as u16
         } else {
             NEUR_ATTN_DIM as u16
         },
+        multi_stream,
+        pot_scale,
+        block_sparse,
+        activation_lut,
     })
 }
 
@@ -137,6 +177,11 @@ pub fn validate_ternary_payload(data: &[u8]) -> bool {
         index += 1;
     }
     true
+}
+
+/// Validates packed signed-nibble PoT attention weights; nibble 8 is reserved.
+pub fn validate_pot_payload(data: &[u8]) -> bool {
+    !data.is_empty() && data.iter().all(|byte| byte & 0x0F != 8 && byte >> 4 != 8)
 }
 
 /// Encodes a single ternary weight (`-1`, `0`, `+1`) into its 2-bit representation.

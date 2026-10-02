@@ -19,6 +19,121 @@ pub struct PciDeviceInfo {
     pub bar0_mmio: *mut u8,
 }
 
+/// QEMU IVSHMEM device exposing a shared-memory aperture in PCI BAR2.
+#[derive(Clone, Copy, Debug)]
+pub struct PciSharedMemoryInfo {
+    pub bus: u8,
+    pub slot: u8,
+    pub func: u8,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub bar0_phys: u64,
+    pub shared_memory_phys: u64,
+    pub shared_memory_size: u64,
+}
+
+fn bar_base(bus: u8, slot: u8, func: u8, index: u8) -> Option<(u64, bool)> {
+    let offset = 0x10 + index * 4;
+    let low = unsafe { pci_read_u32(bus, slot, func, offset) };
+    if low == 0 || low == u32::MAX || low & 1 != 0 {
+        return None;
+    }
+    let is_64bit = low & 0x06 == 0x04;
+    let high = if is_64bit {
+        unsafe { pci_read_u32(bus, slot, func, offset + 4) }
+    } else {
+        0
+    };
+    Some((((high as u64) << 32) | (low as u64 & !0x0F), is_64bit))
+}
+
+/// Measures a memory BAR's size using the PCI sizing-mask procedure.
+/// The previous command and BAR values are restored before returning.
+unsafe fn bar_size(bus: u8, slot: u8, func: u8, index: u8, is_64bit: bool) -> Option<u64> {
+    let offset = 0x10 + index * 4;
+    let saved_command = pci_read_u32(bus, slot, func, 0x04);
+    let saved_low = pci_read_u32(bus, slot, func, offset);
+    let saved_high = if is_64bit {
+        pci_read_u32(bus, slot, func, offset + 4)
+    } else {
+        0
+    };
+
+    // Disable memory decoding while probing to avoid exposing a temporary BAR value.
+    pci_write_u32(bus, slot, func, 0x04, saved_command & !(1 << 1));
+    pci_write_u32(bus, slot, func, offset, u32::MAX);
+    if is_64bit {
+        pci_write_u32(bus, slot, func, offset + 4, u32::MAX);
+    }
+    let mask_low = pci_read_u32(bus, slot, func, offset) & !0x0F;
+    let mask_high = if is_64bit {
+        pci_read_u32(bus, slot, func, offset + 4)
+    } else {
+        0
+    };
+    pci_write_u32(bus, slot, func, offset, saved_low);
+    if is_64bit {
+        pci_write_u32(bus, slot, func, offset + 4, saved_high);
+    }
+    pci_write_u32(bus, slot, func, 0x04, saved_command);
+
+    let mask = ((mask_high as u64) << 32) | mask_low as u64;
+    if mask == 0 {
+        return None;
+    }
+    Some((!mask).wrapping_add(1))
+}
+
+/// Finds the QEMU IVSHMEM device (`1AF4:1110`) and returns BAR2, its shared-RAM aperture.
+/// BAR0 is reported separately because it normally contains device registers, not the ring.
+pub unsafe fn find_ivshmem_device() -> Option<PciSharedMemoryInfo> {
+    for bus in 0..=u8::MAX {
+        for slot in 0..32 {
+            for func in 0..8 {
+                let id = pci_read_u32(bus, slot, func, 0x00);
+                let vendor_id = id as u16;
+                if vendor_id == u16::MAX {
+                    if func == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                let device_id = (id >> 16) as u16;
+                if vendor_id == 0x1AF4 && device_id == 0x1110 {
+                    let (bar0_phys, _) = bar_base(bus, slot, func, 0)?;
+                    let (shared_memory_phys, is_64bit) = bar_base(bus, slot, func, 2)?;
+                    let shared_memory_size = bar_size(bus, slot, func, 2, is_64bit)?;
+                    if shared_memory_phys == 0 || shared_memory_size == 0 {
+                        return None;
+                    }
+
+                    let mut command = pci_read_u32(bus, slot, func, 0x04);
+                    command |= (1 << 1) | (1 << 2);
+                    pci_write_u32(bus, slot, func, 0x04, command);
+                    return Some(PciSharedMemoryInfo {
+                        bus,
+                        slot,
+                        func,
+                        vendor_id,
+                        device_id,
+                        bar0_phys,
+                        shared_memory_phys,
+                        shared_memory_size,
+                    });
+                }
+
+                if func == 0 {
+                    let header_type = (pci_read_u32(bus, slot, 0, 0x0C) >> 16) & 0xFF;
+                    if header_type & 0x80 == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Helper to write a 32-bit dword to an x86 I/O port.
 #[inline(always)]
 unsafe fn outl(port: u16, val: u32) {

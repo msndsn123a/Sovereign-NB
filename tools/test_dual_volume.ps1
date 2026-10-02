@@ -1,5 +1,8 @@
 param(
     [int]$Port = 5570,
+    [ValidateRange(1, 64)][int]$CpuCount = 1,
+    [switch]$TamperWeights,
+    [switch]$RequireSparseActivation,
     [string]$QemuAccel = "",
     [string]$QemuCpu = "Skylake-Server,+avx512f,+avx512dq",
     [string]$ImagePath = "dist/neural_box_appliance.img"
@@ -16,12 +19,36 @@ try {
     $efiPath = "target/x86_64-unknown-uefi/release/neural_box_core.efi"
     if (-not (Test-Path $efiPath)) { throw "UEFI binary not found: $efiPath" }
 
+    if ($TamperWeights) {
+        $validShard = "dist/production_shard.bin"
+        if (-not (Test-Path $validShard)) { throw "Signed test shard not found: $validShard" }
+        $mutated = [System.IO.File]::ReadAllBytes((Resolve-Path $validShard))
+        if ($mutated.Length -lt 80 -or [BitConverter]::ToUInt32($mutated, 4) -ne 2) {
+            throw "Tamper test requires a signed NEUR v2 shard"
+        }
+        $mutated[80] = [byte]($mutated[80] -bxor 0x01)
+        $tamperedPath = "dist/tampered_weights.bin"
+        [System.IO.File]::WriteAllBytes($tamperedPath, $mutated)
+        $ImagePath = "dist/neural_box_tampered.img"
+        python tools/package_image.py --shard-path $tamperedPath --output $ImagePath
+        if ($LASTEXITCODE -ne 0) { throw "Tampered image packaging failed: $LASTEXITCODE" }
+        Write-Host "[SECURITY TEST]: Mutated payload byte; boot must reject the shard signature."
+    }
+    if ($TamperWeights -and $RequireSparseActivation) {
+        throw "Sparse activation validation cannot be combined with the tamper test"
+    }
+
     $qemu = (Get-Command qemu-system-x86_64 -ErrorAction Stop).Source
-    $serialLog = "dist/qemu-dual-volume-com1.log"
+    $serialLog = if ($RequireSparseActivation) {
+        "dist/qemu-dual-volume-sparse-com1.log"
+    } else {
+        "dist/qemu-dual-volume-com1.log"
+    }
     $qemuArgs = @(
         "-bios", "assets/OVMF.fd",
         "-drive", "file=$ImagePath,if=none,id=nvm1,format=raw",
         "-device", "nvme,serial=deadbeef,drive=nvm1",
+        "-smp", "$CpuCount",
         "-cpu", $QemuCpu,
         "-net", "none",
         "-display", "none",
@@ -95,13 +122,41 @@ try {
     if (-not $qemuProcess.WaitForExit(30000)) { throw "QEMU did not exit after 8 stream frames" }
     if ($qemuProcess.ExitCode -ne 0) { throw "QEMU exited with code $($qemuProcess.ExitCode)" }
 
+    $expectedAps = $CpuCount - 1
     $required = @(
         "\[LOADER\]: Read weights.bin from UEFI SimpleFileSystem \(1024 bytes\)",
-        "\[LOADER\]: Validated file shard from UEFI FAT volume \(1024 bytes\)",
-        "\[LOADER\]: Using model shard from UEFI FAT filesystem",
-        "\[SHARD\]: MAGIC=0x4E455552, VERSION=1, INPUT_DIM=64, MODEL_TYPE=0",
+        "\[SECURITY (TME|SME|MEM)\]:",
+        "\[SECURITY GATE\]: strict_memory_encryption=false, policy_satisfied=(true|false)",
+        "\[PAGING\]: Custom CR3 activated .*encrypted huge pages=[0-9]+, C-bit mask=0x[0-9a-fA-F]{16}",
+        "\[SMP\]: $expectedAps/$expectedAps Application Processors awakened and parked",
+        "\[WATCHDOG\]: WDAT unavailable; safe no-op fallback \(no chipset TCO base guessed\)\.",
+        "\[TOPOLOGY\]: Uniform/Symmetric",
         "\[UART\]: RX frames=8, TX frames=8, reset_commands=0, stream_events=8, ring_full_drops=0"
     )
+    if ($CpuCount -gt 1) {
+        $required += "\[TOPOLOGY AUX VERIFY\]: APIC ID=[0-9]+, ring_samples=[1-9][0-9]*, queue_depth=[0-9]+"
+    }
+    if ($TamperWeights) {
+        $required += @(
+            "\[SECURITY\]: Signature mismatch or invalid header - rejecting shard",
+            "\[SECURITY\]: Rejected unsigned or tampered shard; using safe identity model\."
+        )
+    } else {
+        $required += @(
+            "\[LOADER\]: Validated file shard from UEFI FAT volume \(1024 bytes\)",
+            "\[LOADER\]: Using model shard from UEFI FAT filesystem",
+            "\[SECURITY\]: Shard signature valid \(Ed25519 verified\)",
+            "\[SHARD\]: MAGIC=0x4E455552, VERSION=2, INPUT_DIM=64, MODEL_TYPE=0"
+        )
+        if ($RequireSparseActivation) {
+            $required += @(
+                "\[SHARD CONFIG\]: multi_stream=false, quant_type=0, pot_scale=0, block_sparse=true, activation_lut=true",
+                "\[SPARSE VERIFY\]: dense_scalar=match, sparse_scalar=match, vector=(match|disabled), active_blocks=160/320",
+                "\[MLP KERNEL\]: evaluator=block-sparse-(scalar|avx512), active_blocks=160/320, skipped_blocks=160, activation_lut=true",
+                "\[ACTIVATION LUT\]: integer SiLU Q4, entries=256, bytes=512, align=64, initial_L1_warm_lines=8, checksum=-?[0-9]+, enabled=true"
+            )
+        }
+    }
     $telemetry = Select-String -Path $serialLog -Pattern $required
     $telemetry | ForEach-Object { Write-Host $_.Line }
     foreach ($pattern in $required) {
@@ -109,10 +164,27 @@ try {
             throw "COM1 log did not contain required filesystem-load/stream pattern: $pattern"
         }
     }
-    if (Select-String -Path $serialLog -Pattern "\[LOADER\]: Loaded shard from raw NVMe" -Quiet) {
+    $cycleTelemetry = Select-String -Path $serialLog -Pattern "\[TELEMETRY\]: frames=8, min_cycles=[0-9]+, max_cycles=[0-9]+, avg_cycles=[0-9]+"
+    if (-not $cycleTelemetry) { throw "COM1 log did not include the eight-frame cycle benchmark" }
+    Write-Host $cycleTelemetry.Line
+    $powerTelemetry = Select-String -Path $serialLog -Pattern "\[POWER\]: WAITPKG (active \(UMONITOR/UMWAIT\)|unsupported, falling back to PAUSE loop)"
+    if (-not $powerTelemetry) { throw "COM1 log did not report WAITPKG activation or fallback" }
+    Write-Host $powerTelemetry.Line
+    if (-not $TamperWeights -and (Select-String -Path $serialLog -Pattern "\[LOADER\]: Loaded shard from raw NVMe" -Quiet)) {
         throw "Guest loaded from the raw NVMe fallback instead of the FAT filesystem"
     }
-    Write-Host "[DUAL VOLUME TEST]: PASS; weights.bin loaded through UEFI SimpleFileSystem, streaming completed with zero drops."
+    if ($TamperWeights) {
+        if (Select-String -Path $serialLog -Pattern "\[SECURITY\]: Shard signature valid" -Quiet) {
+            throw "Tampered model was incorrectly accepted"
+        }
+        Write-Host "[SECURITY TEST]: PASS; mutated shard rejected and safe identity fallback completed with zero drops."
+    } else {
+        if ($RequireSparseActivation) {
+            Write-Host "[DUAL VOLUME TEST]: PASS; sparse blocks skipped, LUT activation warmed and evaluated, dense/sparse parity verified, streaming completed with zero drops."
+        } else {
+            Write-Host "[DUAL VOLUME TEST]: PASS; signed weights.bin authenticated through UEFI SimpleFileSystem and streaming completed with zero drops."
+        }
+    }
 } finally {
     if ($client) { $client.Dispose() }
     if ($qemuProcess -and -not $qemuProcess.HasExited) {

@@ -10,6 +10,9 @@ pub const COM1_BASE: u16 = 0x3F8;
 pub const COM2_BASE: u16 = 0x2F8;
 pub const INPUT_PREAMBLE: [u8; 2] = *b"NB";
 pub const OUTPUT_PREAMBLE: [u8; 2] = *b"NR";
+pub const STREAM_PREAMBLE: [u8; 2] = *b"NS";
+pub const UPDATE_PREAMBLE: [u8; 2] = *b"NU";
+pub const ATTENTION_STREAM_COUNT: u8 = 8;
 
 /// Line Status Register bit 5: Transmitter Holding Register Empty (THRE).
 pub const LSR_THRE: u8 = 0x20;
@@ -116,16 +119,28 @@ pub struct FrameReader {
     index: usize,
     payload: [i8; 64],
     preamble_tsc: u64,
+    reset_tsc: u64,
+    stream_id: u8,
+    update_lba_bytes: [u8; 8],
 }
 
 pub struct ReceivedFrame {
     pub payload: [i8; 64],
     pub preamble_tsc: u64,
+    pub ingress_tsc: u64,
+    pub stream_id: u8,
 }
 
 pub enum FrameEvent {
     Input(ReceivedFrame),
-    Reset { preamble_tsc: u64 },
+    Reset {
+        preamble_tsc: u64,
+        stream_id: Option<u8>,
+    },
+    Update {
+        lba: u64,
+    },
+    InvalidStreamSelector(u8),
 }
 
 impl FrameReader {
@@ -135,17 +150,47 @@ impl FrameReader {
             index: 0,
             payload: [0; 64],
             preamble_tsc: 0,
+            reset_tsc: 0,
+            stream_id: 0,
+            update_lba_bytes: [0; 8],
         }
     }
 
     /// Consumes available UART bytes and returns a complete frame when found.
     pub fn poll_frame(&mut self, base: u16) -> Option<FrameEvent> {
         loop {
-            let byte = poll_byte_from(base)?;
+            let byte = match poll_byte_from(base) {
+                Some(byte) => byte,
+                None => return self.expire_legacy_reset(),
+            };
             if let Some(event) = self.consume_byte(byte) {
                 return Some(event);
             }
         }
+    }
+
+    fn expire_legacy_reset(&mut self) -> Option<FrameEvent> {
+        const FALLBACK_TIMEOUT_CYCLES: u64 = 10_000_000;
+        if self.state != 4 {
+            return None;
+        }
+        let timeout = crate::timer::tsc_frequency_hz()
+            .checked_div(200)
+            .unwrap_or(0)
+            .max(100_000);
+        let timeout = if crate::timer::tsc_frequency_hz() == 0 {
+            FALLBACK_TIMEOUT_CYCLES
+        } else {
+            timeout
+        };
+        if unsafe { crate::timer::read_tsc() }.saturating_sub(self.reset_tsc) < timeout {
+            return None;
+        }
+        self.state = 0;
+        Some(FrameEvent::Reset {
+            preamble_tsc: self.preamble_tsc,
+            stream_id: None,
+        })
     }
 
     fn consume_byte(&mut self, byte: u8) -> Option<FrameEvent> {
@@ -160,15 +205,49 @@ impl FrameReader {
                 if byte == INPUT_PREAMBLE[1] {
                     self.state = 2;
                     self.index = 0;
+                    self.stream_id = 0;
                 } else if byte == OUTPUT_PREAMBLE[1] {
-                    self.state = 0;
-                    return Some(FrameEvent::Reset {
-                        preamble_tsc: self.preamble_tsc,
-                    });
+                    self.state = 4;
+                    self.reset_tsc = unsafe { crate::timer::read_tsc() };
+                } else if byte == STREAM_PREAMBLE[1] {
+                    self.state = 3;
+                } else if byte == UPDATE_PREAMBLE[1] {
+                    self.state = 6;
+                    self.index = 0;
                 } else if byte == INPUT_PREAMBLE[0] {
                     self.preamble_tsc = unsafe { crate::timer::read_tsc() };
                 } else {
                     self.state = 0;
+                }
+            }
+            3 => {
+                if byte >= ATTENTION_STREAM_COUNT {
+                    self.state = 0;
+                    return Some(FrameEvent::InvalidStreamSelector(byte));
+                }
+                self.stream_id = byte;
+                self.index = 0;
+                self.state = 5;
+            }
+            4 => {
+                self.state = 0;
+                if byte < ATTENTION_STREAM_COUNT {
+                    return Some(FrameEvent::Reset {
+                        preamble_tsc: self.preamble_tsc,
+                        stream_id: Some(byte),
+                    });
+                }
+                return Some(FrameEvent::InvalidStreamSelector(byte));
+            }
+            6 => {
+                self.update_lba_bytes[self.index] = byte;
+                self.index += 1;
+                if self.index == self.update_lba_bytes.len() {
+                    self.state = 0;
+                    self.index = 0;
+                    return Some(FrameEvent::Update {
+                        lba: u64::from_le_bytes(self.update_lba_bytes),
+                    });
                 }
             }
             _ => {
@@ -180,6 +259,8 @@ impl FrameReader {
                     return Some(FrameEvent::Input(ReceivedFrame {
                         payload: self.payload,
                         preamble_tsc: self.preamble_tsc,
+                        ingress_tsc: unsafe { crate::timer::read_tsc_with_aux() }.0,
+                        stream_id: self.stream_id,
                     }));
                 }
             }
@@ -252,4 +333,22 @@ macro_rules! serial_println {
     ($($arg:tt)*) => {
         $crate::serial_print!("{}\n", format_args!($($arg)*))
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nu_control_parses_little_endian_lba() {
+        let expected_lba = 264_192u64;
+        let mut reader = FrameReader::new();
+        assert!(reader.consume_byte(b'N').is_none());
+        assert!(reader.consume_byte(b'U').is_none());
+        let mut event = None;
+        for byte in expected_lba.to_le_bytes() {
+            event = reader.consume_byte(byte);
+        }
+        assert!(matches!(event, Some(FrameEvent::Update { lba }) if lba == expected_lba));
+    }
 }

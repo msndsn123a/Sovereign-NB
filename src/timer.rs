@@ -4,6 +4,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 static TSC_FREQUENCY_HZ: AtomicU64 = AtomicU64::new(0);
 static CALIBRATION_SOURCE: AtomicU64 = AtomicU64::new(0);
+static TSC_RDTSCP_SUPPORTED: AtomicU64 = AtomicU64::new(0);
 
 pub const MAX_LATENCY_SAMPLES: usize = 128;
 
@@ -32,12 +33,38 @@ pub unsafe fn read_tsc() -> u64 {
     value
 }
 
+/// Reads a serialized TSC value and the RDTSCP processor auxiliary value.
+/// The auxiliary value is zero when the processor does not support RDTSCP.
+#[inline(always)]
+pub unsafe fn read_tsc_with_aux() -> (u64, u32) {
+    core::arch::x86_64::_mm_lfence();
+    if TSC_RDTSCP_SUPPORTED.load(Ordering::Relaxed) != 0 {
+        let low: u32;
+        let high: u32;
+        let processor_id: u32;
+        core::arch::asm!(
+            "rdtscp",
+            "lfence",
+            out("eax") low,
+            out("edx") high,
+            out("ecx") processor_id,
+            options(nomem, nostack, preserves_flags)
+        );
+        (((high as u64) << 32) | low as u64, processor_id)
+    } else {
+        let cycles = core::arch::x86_64::_rdtsc();
+        core::arch::x86_64::_mm_lfence();
+        (cycles, 0)
+    }
+}
+
 /// Calibrates from CPUID leaf 0x15 when it supplies a complete ratio, otherwise
 /// measures a 100 ms Boot Services stall. Returns the measured frequency in Hz.
 pub fn calibrate_tsc<F>(mut stall: F) -> u64
 where
     F: FnMut(usize),
 {
+    TSC_RDTSCP_SUPPORTED.store(u64::from(cpuid_supports_rdtscp()), Ordering::Release);
     let cpuid_hz = cpuid_tsc_frequency_hz();
     let frequency_hz = if cpuid_hz != 0 {
         CALIBRATION_SOURCE.store(1, Ordering::Release);
@@ -52,6 +79,12 @@ where
 
     TSC_FREQUENCY_HZ.store(frequency_hz, Ordering::Release);
     frequency_hz
+}
+
+fn cpuid_supports_rdtscp() -> bool {
+    let max_extended_leaf = core::arch::x86_64::__cpuid(0x8000_0000).eax;
+    max_extended_leaf >= 0x8000_0001
+        && (core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 27)) != 0
 }
 
 fn cpuid_tsc_frequency_hz() -> u64 {

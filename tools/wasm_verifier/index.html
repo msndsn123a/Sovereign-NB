@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#08111f">
+  <title>NEUR · Wasm Inference Lab</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #08111f;
+      color: #e6edf7;
+      --panel: #101c2d; --border: #263852; --muted: #95a8c1;
+      --cyan: #55d7e8; --green: #7be0b0; --red: #ff8190;
+      --mono: ui-monospace, "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; background: radial-gradient(ellipse at 15% 0%, #173253 0, transparent 38%), #08111f; }
+    .shell { width: min(1240px, calc(100% - 36px)); margin: 0 auto; padding: 38px 0 60px; }
+    .topline { display: flex; align-items: center; gap: 10px; color: var(--cyan); font: 700 11px/1 var(--mono); letter-spacing: .16em; text-transform: uppercase; }
+    .topline::before { content: ""; width: 22px; height: 1px; background: var(--cyan); }
+    h1 { margin: 15px 0 8px; font-size: clamp(30px, 5vw, 48px); line-height: 1.08; letter-spacing: -.045em; }
+    .lede { max-width: 770px; margin: 0; color: #aabbd0; font-size: 15px; }
+    .hero { display: flex; justify-content: space-between; align-items: end; gap: 28px; margin-bottom: 27px; }
+    .hero-mark { flex: 0 0 auto; color: #7391b0; text-align: right; font: 11px/1.8 var(--mono); }
+    .hero-mark strong { color: #cad8e9; font-size: 13px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 23px 0 15px; }
+    button, select { font: inherit; border: 1px solid var(--border); border-radius: 9px; color: #e9f2fd; background: #162740; }
+    button { min-height: 43px; padding: 10px 16px; font-weight: 750; cursor: pointer; transition: transform .16s, border-color .16s, filter .16s; }
+    button:hover:not(:disabled) { transform: translateY(-1px); border-color: #4f789d; filter: brightness(1.12); }
+    button:focus-visible, select:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+    button:disabled { opacity: .55; cursor: progress; }
+    .primary { background: linear-gradient(135deg, #55d7e8, #6aa9ff); border: 0; color: #061422; }
+    .secondary { background: #14243a; }
+    .status-row { display: flex; min-height: 40px; align-items: center; gap: 12px; margin-bottom: 19px; }
+    .badge { display: inline-flex; align-items: center; gap: 8px; padding: 6px 11px; border: 1px solid #435671; border-radius: 999px; background: #15233a; color: #becce0; font: 800 11px/1 var(--mono); letter-spacing: .08em; }
+    .badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #8394a8; }
+    .badge.pass { color: var(--green); border-color: #27684f; background: #102b27; }
+    .badge.pass::before { background: var(--green); box-shadow: 0 0 12px #7be0b0aa; }
+    .badge.fail { color: var(--red); border-color: #703844; background: #301c27; }
+    .badge.fail::before { background: var(--red); }
+    .badge.busy { color: #ffe19a; border-color: #74603a; }
+    .badge.busy::before { background: #ffe19a; animation: blink .65s infinite alternate; }
+    .badge.pulse { animation: badge-pop .42s ease-out; }
+    .status-copy { color: var(--muted); font-size: 12px; }
+    .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 15px; }
+    .metric, .panel { border: 1px solid var(--border); border-radius: 13px; background: linear-gradient(160deg, #122036, var(--panel)); }
+    .metric { min-height: 82px; padding: 13px 16px; }
+    .metric-label { color: var(--muted); font: 10px/1.4 var(--mono); letter-spacing: .09em; text-transform: uppercase; }
+    .metric-value { margin-top: 5px; color: #eff7ff; font: 700 21px/1.2 var(--mono); }
+    .metric-value small { color: var(--muted); font-size: 11px; font-weight: 500; }
+    .grid-two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
+    .panel { min-width: 0; padding: 18px; margin-top: 14px; }
+    .panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 14px; }
+    h2 { margin: 0; font-size: 15px; letter-spacing: -.01em; }
+    .panel-subtitle { margin: 4px 0 0; color: var(--muted); font-size: 11px; }
+    .micro-label { color: #7990ac; font: 10px/1.5 var(--mono); text-align: right; }
+    .byte-grid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 5px; }
+    .byte { display: grid; place-items: center; min-height: 29px; border: 1px solid #293b54; border-radius: 5px; background: #0d1929; color: #b9cee2; font: 10px/1 var(--mono); transition: background .25s, color .25s; }
+    .byte.changed { color: #071622; background: #55d7e8; border-color: #55d7e8; }
+    .byte-index { display: block; color: #68809c; font: 8px/1.1 var(--mono); }
+    .token-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
+    .token { min-height: 46px; padding: 7px 9px; border: 1px solid #2b405b; border-radius: 7px; background: #0d1929; }
+    .token-index { display: block; color: #738aa7; font: 9px/1.2 var(--mono); }
+    .token-value { display: block; margin-top: 1px; color: #e8f3ff; font: 700 15px/1.2 var(--mono); }
+    .table-wrap { overflow: auto; max-height: 430px; border: 1px solid #25364e; border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; font: 11px/1.35 var(--mono); }
+    thead { position: sticky; top: 0; z-index: 1; background: #192941; }
+    th { padding: 9px 11px; color: #a9bdd4; text-align: right; font-weight: 650; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; }
+    td { padding: 7px 11px; border-top: 1px solid #1e2e43; color: #dce8f5; text-align: right; }
+    .delta-zero { color: var(--green); }
+    .delta-nonzero { color: var(--red); font-weight: 800; }
+    .suite-results { display: grid; gap: 6px; margin-top: 12px; }
+    .suite-case { display: flex; justify-content: space-between; gap: 10px; padding: 7px 9px; border-radius: 6px; background: #0c1726; color: #a9bad0; font: 10px/1.3 var(--mono); }
+    .suite-case strong { color: var(--green); font-weight: 700; }
+    select { min-height: 34px; padding: 5px 9px; font: 11px var(--mono); }
+    .attention-top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; }
+    .stream-control { display: flex; align-items: center; gap: 8px; color: #a3b7ce; font: 10px var(--mono); }
+    .matrix-wrap { overflow: auto; }
+    .matrix { display: grid; grid-template-columns: 25px repeat(16, minmax(27px, 1fr)); gap: 3px; min-width: 510px; }
+    .matrix-label { display: grid; place-items: center; color: #738aa7; font: 8px/1 var(--mono); }
+    .matrix-cell { display: grid; place-items: center; min-height: 25px; border: 1px solid #2c4059; border-radius: 4px; background: #101d30; color: #c4d6e9; font: 9px/1 var(--mono); transition: background .24s, transform .2s; }
+    .matrix-cell.updated { animation: cell-flash .38s ease-out; }
+    .attention-output { display: flex; justify-content: space-between; gap: 12px; margin-top: 13px; color: #8fa5bf; font-size: 10px; }
+    .attention-output code { color: #d6e6f5; font: 10px var(--mono); text-align: right; overflow-wrap: anywhere; }
+    .suite-footer { color: var(--muted); font-size: 10px; margin: 15px 2px 0; }
+    .suite-footer code { color: #c2d6ed; }
+    @keyframes badge-pop { 0% { transform: scale(.93); } 65% { transform: scale(1.06); } 100% { transform: scale(1); } }
+    @keyframes blink { to { opacity: .35; } }
+    @keyframes cell-flash { 0% { transform: scale(.88); filter: brightness(1.9); } 100% { transform: scale(1); filter: brightness(1); } }
+    @media (max-width: 780px) { .hero { align-items: flex-start; } .hero-mark { display: none; } .grid-two { grid-template-columns: 1fr; } .shell { width: min(100% - 22px, 650px); padding-top: 25px; } .panel { padding: 14px; } }
+    @media (max-width: 430px) { .metrics { gap: 6px; } .metric { min-height: 74px; padding: 10px; } .metric-value { font-size: 17px; } .byte-grid { gap: 3px; } .byte { min-height: 26px; font-size: 9px; } .actions button { flex: 1 1 100%; } }
+  </style>
+</head>
+<body>
+<main class="shell">
+  <header class="hero">
+    <div>
+      <div class="topline">No-std Rust · WebAssembly · exact integer math</div>
+      <h1>NEUR Inference Lab</h1>
+      <p class="lede">A live, inspectable parity playground. Randomize signed-byte inputs, run the real Wasm kernels, compare every output against the integer UEFI scalar reference, and watch recurrent attention state evolve by stream.</p>
+    </div>
+    <div class="hero-mark"><strong>64 → 32 → 16</strong><br>TERNARY MLP<br>16 × 16 RECURRENT STATE</div>
+  </header>
+
+  <div class="actions">
+    <button id="run-suite" class="primary">▶ Run Parity Suite</button>
+    <button id="random-infer" class="secondary">⟳ Randomize Inputs &amp; Infer</button>
+  </div>
+  <div class="status-row"><span id="status-badge" class="badge" role="status" aria-live="polite">READY</span><span id="status-copy" class="status-copy">Load the no-std Wasm module to begin.</span></div>
+
+  <section class="metrics" aria-label="Live inference metrics">
+    <div class="metric"><div class="metric-label">Wasm latency · mean / 128</div><div class="metric-value"><span id="latency-us">—</span> <small>µs</small></div></div>
+    <div class="metric"><div class="metric-label">Exact output elements</div><div class="metric-value"><span id="exact-count">—</span> <small>/ 16</small></div></div>
+    <div class="metric"><div class="metric-label">Selected recurrent stream</div><div class="metric-value"><span id="active-stream">0</span> <small>of 8</small></div></div>
+  </section>
+
+  <div class="grid-two">
+    <section class="panel">
+      <div class="panel-heading"><div><h2>Input vector · signed bytes</h2><p class="panel-subtitle">All 64 raw <code>i8</code> lanes sent to Wasm</p></div><span class="micro-label">INDEX · DECIMAL</span></div>
+      <div id="input-bytes" class="byte-grid" aria-label="64 signed input bytes"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-heading"><div><h2>Live Wasm output</h2><p class="panel-subtitle">16 integer output tokens from <code>neur_mlp</code></p></div><span class="micro-label">INT32</span></div>
+      <div id="output-tokens" class="token-grid" aria-label="16 Wasm output integers"></div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <div class="panel-heading"><div><h2>Side-by-side exact verification</h2><p class="panel-subtitle">Golden UEFI scalar reference vs live Wasm result · Δ = Wasm − Golden</p></div><span class="micro-label">PER-ELEMENT<br>BIT-EXACT CHECK</span></div>
+    <div class="table-wrap"><table aria-label="Golden UEFI scalar reference compared against live WebAssembly outputs"><thead><tr><th>Output</th><th>Golden UEFI Reference</th><th>Live Wasm</th><th>Δ</th></tr></thead><tbody id="comparison-rows"><tr><td colspan="4" style="text-align:center;color:#8298b2;padding:22px">Run inference to populate the comparison.</td></tr></tbody></table></div>
+    <div id="suite-results" class="suite-results" aria-live="polite"></div>
+    <p class="suite-footer">The reference uses the same packed ternary model and shared integer scalar semantics as the UEFI kernel. No floating-point inference or external scripts are used.</p>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading attention-top"><div><h2>Recurrent attention · live state</h2><p class="panel-subtitle">Each selected token updates its stream-local 16 × 16 integer memory</p></div><label class="stream-control" for="stream-select">STREAM<select id="stream-select" aria-label="Select recurrent attention stream"></select></label></div>
+    <div id="attention-matrix" class="matrix-wrap" aria-label="16 by 16 recurrent attention state matrix"></div>
+    <div class="attention-output"><span>Last attention output · 16 integers</span><code id="attention-output">not evaluated</code></div>
+  </section>
+</main>
+
+<script type="module">
+const $ = (selector) => document.querySelector(selector);
+const suiteButton = $('#run-suite');
+const randomButton = $('#random-infer');
+const badge = $('#status-badge');
+const statusCopy = $('#status-copy');
+const streamSelect = $('#stream-select');
+const ui = { latency: $('#latency-us'), exact: $('#exact-count'), activeStream: $('#active-stream'), inputs: $('#input-bytes'), outputs: $('#output-tokens'), rows: $('#comparison-rows'), suite: $('#suite-results'), matrix: $('#attention-matrix'), attentionOutput: $('#attention-output') };
+const app = { runtime: null, input: new Int8Array(64), previousBytes: new Int8Array(64), selectedStream: 0 };
+
+function setBadge(kind, label, message) {
+  badge.className = `badge ${kind}`; badge.textContent = label; statusCopy.textContent = message;
+  badge.classList.remove('pulse'); requestAnimationFrame(() => badge.classList.add('pulse'));
+}
+function setTernary(packed, weightIndex, value) {
+  const code = value > 0 ? 1 : value < 0 ? 3 : 0, byte = weightIndex >>> 2, shift = (weightIndex & 3) * 2;
+  packed[byte] = (packed[byte] & ~(3 << shift)) | (code << shift);
+}
+function readTernary(packed, index) {
+  const code = (packed[index >>> 2] >>> ((index & 3) * 2)) & 3;
+  return code === 1 ? 1 : code === 3 ? -1 : 0;
+}
+
+function buildModel() {
+  const layer1 = new Uint8Array(512), layer2 = new Uint8Array(128);
+  for (let row = 0; row < 32; row++) for (let col = 0; col < 64; col++) {
+    const code = (row * 13 + col * 7) % 3;
+    setTernary(layer1.subarray(row * 16, row * 16 + 16), col, code === 0 ? 0 : code === 1 ? 1 : -1);
+  }
+  for (let row = 0; row < 16; row++) for (let col = 0; col < 32; col++) {
+    const code = (row * 5 + col * 11) % 3;
+    setTernary(layer2.subarray(row * 8, row * 8 + 8), col, code === 0 ? 0 : code === 1 ? 1 : -1);
+  }
+  const attention = new Uint8Array(832);
+  for (let row = 0; row < 16; row++) {
+    setTernary(attention.subarray(0, 256), row * 64 + row, 1);
+    setTernary(attention.subarray(256, 512), row * 64 + row, 1);
+    setTernary(attention.subarray(512, 768), row * 64 + row, 1);
+    setTernary(attention.subarray(768, 832), row * 16 + row, 1);
+  }
+  return { layer1, layer2, attention };
+}
+
+async function loadRuntime() {
+  if (app.runtime) return app.runtime;
+  setBadge('busy', 'LOADING', 'Fetching and initializing the standalone Wasm kernels…');
+  const wasmUrl = new URL('./wasm_verifier.wasm', import.meta.url);
+  let response;
+  try { response = await fetch(wasmUrl); }
+  catch { throw new Error(`Cannot reach ${location.origin}. Start the local server from the repository root: node tools/wasm_verifier/serve.js`); }
+  if (!response.ok) throw new Error(`Wasm fetch failed (${response.status} ${response.statusText}). Build with tools/wasm_verifier/build.ps1.`);
+  let loaded;
+  try { loaded = await WebAssembly.instantiateStreaming(response.clone(), {}); }
+  catch (error) { if (!(error instanceof TypeError)) throw error; loaded = await WebAssembly.instantiate(await response.arrayBuffer(), {}); }
+  const { instance } = loaded;
+  const { memory, neur_alloc, neur_mlp, neur_causal_attention } = instance.exports;
+  if (![memory, neur_alloc, neur_mlp, neur_causal_attention].every(Boolean)) throw new Error('Wasm artifact is missing a NEUR inference export. Rebuild wasm_verifier.wasm.');
+  const alloc = (bytes, alignment = 4) => {
+    const pointer = neur_alloc(bytes, alignment) >>> 0;
+    if (pointer === 0) throw new Error(`Wasm could not allocate ${bytes} bytes.`);
+    return pointer;
+  };
+  const pointers = { input: alloc(64, 16), layer1: alloc(512, 16), layer2: alloc(128, 16), output: alloc(64, 16), attention: alloc(832, 16), states: alloc(8 * 256 * 4, 64), attentionOutput: alloc(16 * 4, 16) };
+  const model = buildModel();
+  new Uint8Array(memory.buffer, pointers.layer1, 512).set(model.layer1);
+  new Uint8Array(memory.buffer, pointers.layer2, 128).set(model.layer2);
+  new Uint8Array(memory.buffer, pointers.attention, 832).set(model.attention);
+  new Int32Array(memory.buffer, pointers.states, 8 * 256).fill(0);
+  app.runtime = { memory, pointers, model, neur_mlp, neur_causal_attention };
+  return app.runtime;
+}
+
+function scalarReference(input, layer1, layer2) {
+  const hidden = new Int8Array(32);
+  for (let row = 0; row < 32; row++) {
+    let sum = 0;
+    for (let col = 0; col < 64; col++) sum += input[col] * readTernary(layer1.subarray(row * 16, row * 16 + 16), col);
+    hidden[row] = sum < 0 ? -1 : sum > 0 ? 1 : 0;
+  }
+  const outputs = new Int32Array(16);
+  for (let row = 0; row < 16; row++) {
+    let sum = 0;
+    for (let col = 0; col < 32; col++) sum += hidden[col] * readTernary(layer2.subarray(row * 8, row * 8 + 8), col);
+    outputs[row] = sum;
+  }
+  return outputs;
+}
+
+function inferMlp(runtime, input) {
+  const { memory, pointers, neur_mlp } = runtime;
+  new Int8Array(memory.buffer, pointers.input, 64).set(input);
+  const start = performance.now();
+  let result = 0;
+  const timingRepeats = 128;
+  for (let repeat = 0; repeat < timingRepeats; repeat++) {
+    result = neur_mlp(pointers.input, pointers.layer1, pointers.layer2, 0, pointers.output);
+    if (result !== 0) throw new Error(`MLP Wasm call failed with status ${result}.`);
+  }
+  const elapsedUs = ((performance.now() - start) * 1000) / timingRepeats;
+  return { output: new Int32Array(memory.buffer, pointers.output, 16).slice(), elapsedUs };
+}
+function inferAttention(runtime, input, stream) {
+  const { memory, pointers, neur_causal_attention } = runtime;
+  new Int8Array(memory.buffer, pointers.input, 64).set(input);
+  const statePointer = pointers.states + stream * 256 * 4;
+  const result = neur_causal_attention(pointers.input, pointers.attention, statePointer, pointers.attentionOutput);
+  if (result !== 0) throw new Error(`Attention Wasm call failed with status ${result}.`);
+  return new Int32Array(memory.buffer, pointers.attentionOutput, 16).slice();
+}
+
+function renderInput(input) {
+  const fragment = document.createDocumentFragment();
+  for (let index = 0; index < input.length; index++) {
+    const cell = document.createElement('div');
+    cell.className = `byte${input[index] !== app.previousBytes[index] ? ' changed' : ''}`;
+    cell.title = `input[${index}] = ${input[index]}`;
+    cell.innerHTML = `<span class="byte-index">${String(index).padStart(2, '0')}</span>${input[index]}`;
+    fragment.append(cell);
+  }
+  ui.inputs.replaceChildren(fragment); app.previousBytes.set(input);
+}
+function renderTokens(output) {
+  const fragment = document.createDocumentFragment();
+  for (let index = 0; index < output.length; index++) {
+    const token = document.createElement('div'); token.className = 'token';
+    token.innerHTML = `<span class="token-index">OUT ${String(index).padStart(2, '0')}</span><span class="token-value">${output[index]}</span>`;
+    fragment.append(token);
+  }
+  ui.outputs.replaceChildren(fragment);
+}
+function renderComparison(golden, live) {
+  const fragment = document.createDocumentFragment(); let exact = 0;
+  for (let index = 0; index < 16; index++) {
+    const delta = live[index] - golden[index]; if (delta === 0) exact++;
+    const row = document.createElement('tr');
+    row.innerHTML = `<td>OUT ${String(index).padStart(2, '0')}</td><td>${golden[index]}</td><td>${live[index]}</td><td class="${delta === 0 ? 'delta-zero' : 'delta-nonzero'}">${delta > 0 ? '+' : ''}${delta}</td>`;
+    fragment.append(row);
+  }
+  ui.rows.replaceChildren(fragment); ui.exact.textContent = exact; return exact;
+}
+function renderMatrix(runtime, stream, animate = true) {
+  const values = new Int32Array(runtime.memory.buffer, runtime.pointers.states + stream * 256 * 4, 256);
+  const fragment = document.createDocumentFragment();
+  const corner = document.createElement('div'); corner.className = 'matrix-label'; corner.textContent = 'r/c'; fragment.append(corner);
+  for (let col = 0; col < 16; col++) { const label = document.createElement('div'); label.className = 'matrix-label'; label.textContent = col.toString(16).toUpperCase(); fragment.append(label); }
+  for (let row = 0; row < 16; row++) {
+    const label = document.createElement('div'); label.className = 'matrix-label'; label.textContent = row.toString(16).toUpperCase(); fragment.append(label);
+    for (let col = 0; col < 16; col++) {
+      const value = values[row * 16 + col], cell = document.createElement('div');
+      const strength = Math.min(.78, Math.log1p(Math.abs(value)) / 20);
+      cell.className = `matrix-cell${animate && value !== 0 ? ' updated' : ''}`;
+      cell.style.backgroundColor = value === 0 ? '#101d30' : value < 0 ? `rgba(255,105,130,${strength})` : `rgba(73,206,225,${strength})`;
+      cell.style.color = Math.abs(value) > 500 ? '#fff' : '#c4d6e9';
+      cell.title = `state[${row}, ${col}] = ${value}`; cell.textContent = value === 0 ? '·' : String(value); fragment.append(cell);
+    }
+  }
+  ui.matrix.replaceChildren(fragment); ui.activeStream.textContent = stream;
+}
+function renderSuiteCases(cases) {
+  const fragment = document.createDocumentFragment();
+  for (const test of cases) {
+    const row = document.createElement('div'); row.className = 'suite-case';
+    row.innerHTML = `<span>${test.name} · ${test.inputCount} active input lanes</span><strong>${test.pass ? 'EXACT MATCH' : `DRIFT ${test.drift}`}</strong>`;
+    fragment.append(row);
+  }
+  ui.suite.replaceChildren(fragment);
+}
+function fixedVectors() {
+  const pattern = new Int8Array(64), extremes = new Int8Array(64), mixed = new Int8Array(64);
+  for (let index = 0; index < 64; index++) {
+    const unsigned = (index * 73 + 19) & 255;
+    pattern[index] = unsigned > 127 ? unsigned - 256 : unsigned;
+    extremes[index] = index & 1 ? 127 : -128;
+    mixed[index] = [-1, 0, 1, -128][index & 3];
+  }
+  return [{ name: 'Deterministic byte pattern', input: pattern }, { name: 'Signed-byte extremes', input: extremes }, { name: 'Zero / sign / minimum mix', input: mixed }];
+}
+
+async function randomizeAndInfer() {
+  const runtime = await loadRuntime(), bytes = new Uint8Array(64);
+  crypto.getRandomValues(bytes);
+  const input = Int8Array.from(bytes, (value) => value > 127 ? value - 256 : value);
+  const { output, elapsedUs } = inferMlp(runtime, input);
+  const golden = scalarReference(input, runtime.model.layer1, runtime.model.layer2);
+  const exact = renderComparison(golden, output);
+  renderInput(input); renderTokens(output); ui.latency.textContent = elapsedUs.toFixed(3);
+  const attentionOutput = inferAttention(runtime, input, app.selectedStream);
+  $('#attention-output').textContent = `[${Array.from(attentionOutput).join(', ')}]`;
+  renderMatrix(runtime, app.selectedStream);
+  const pass = exact === 16;
+  setBadge(pass ? 'pass' : 'fail', pass ? 'Δ 0 · EXACT' : 'DRIFT FOUND', pass ? 'All 16 Wasm outputs match the UEFI integer scalar reference.' : `${16 - exact} output elements differ from the scalar reference.`);
+}
+async function runParitySuite() {
+  const runtime = await loadRuntime(), vectors = fixedVectors(), cases = [];
+  for (const test of vectors) {
+    const golden = scalarReference(test.input, runtime.model.layer1, runtime.model.layer2);
+    const { output } = inferMlp(runtime, test.input); let drift = 0;
+    for (let index = 0; index < 16; index++) if (output[index] !== golden[index]) drift++;
+    cases.push({ name: test.name, inputCount: test.input.reduce((count, value) => count + Number(value !== 0), 0), pass: drift === 0, drift });
+  }
+  renderSuiteCases(cases);
+  const input = vectors[0].input, { output, elapsedUs } = inferMlp(runtime, input);
+  const golden = scalarReference(input, runtime.model.layer1, runtime.model.layer2);
+  const exact = renderComparison(golden, output);
+  renderInput(input); renderTokens(output); ui.latency.textContent = elapsedUs.toFixed(3);
+  const statePointer = runtime.pointers.states + app.selectedStream * 256 * 4;
+  new Int32Array(runtime.memory.buffer, statePointer, 256).fill(0);
+  const first = new Int8Array(64); first.set([2, 3, 4]);
+  const second = new Int8Array(64); second.set([1, 2, 3]);
+  inferAttention(runtime, first, app.selectedStream);
+  const attentionOutput = inferAttention(runtime, second, app.selectedStream);
+  $('#attention-output').textContent = `[${Array.from(attentionOutput).join(', ')}]`;
+  renderMatrix(runtime, app.selectedStream);
+  const pass = cases.every((test) => test.pass) && exact === 16;
+  setBadge(pass ? 'pass' : 'fail', pass ? 'SUITE PASS' : 'SUITE FAIL', `${cases.filter((test) => test.pass).length}/${cases.length} reference vectors match bit-for-bit; per-output Δ is zero.`);
+}
+
+for (let stream = 0; stream < 8; stream++) {
+  const option = document.createElement('option'); option.value = stream; option.textContent = `Stream ${stream}`; streamSelect.append(option);
+}
+streamSelect.addEventListener('change', () => {
+  app.selectedStream = Number(streamSelect.value); ui.activeStream.textContent = app.selectedStream;
+  if (app.runtime) { renderMatrix(app.runtime, app.selectedStream, false); $('#attention-output').textContent = 'not evaluated'; }
+});
+async function runAction(action) {
+  suiteButton.disabled = randomButton.disabled = true;
+  try { await action(); }
+  catch (error) { setBadge('fail', 'LOAD / RUN ERROR', error?.message ?? String(error)); }
+  finally { suiteButton.disabled = randomButton.disabled = false; }
+}
+suiteButton.addEventListener('click', () => runAction(runParitySuite));
+randomButton.addEventListener('click', () => runAction(randomizeAndInfer));
+
+renderInput(app.input); renderTokens(new Int32Array(16));
+</script>
+</body>
+</html>

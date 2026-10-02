@@ -64,6 +64,26 @@ pub fn read_weights_file(buffer: &mut [u8]) -> Option<usize> {
     None
 }
 
+/// Bind the mailbox to the IVSHMEM shared-memory BAR when it is large enough.
+///
+/// # Safety
+/// The UEFI platform must provide an identity-mapped, writable, cache-coherent
+/// mapping for the PCI shared-memory BAR. Firmware typically maps PCI BARs as
+/// uncacheable; this function does not edit page tables after firmware setup.
+pub unsafe fn bind_ivshmem_mailbox(
+    device: crate::pci::PciSharedMemoryInfo,
+) -> Option<core::ptr::NonNull<crate::shared_mem::SharedMailbox>> {
+    let mailbox_size = core::mem::size_of::<crate::shared_mem::SharedMailbox>() as u64;
+    if device.shared_memory_size < mailbox_size
+        || device.shared_memory_phys
+            % core::mem::align_of::<crate::shared_mem::SharedMailbox>() as u64
+            != 0
+    {
+        return None;
+    }
+    crate::shared_mem::SharedMailbox::bind_host_window(device.shared_memory_phys).ok()
+}
+
 /// Allocates and initializes a persistent-across-ExitBootServices mailbox region.
 /// The returned address is guest physical RAM with an identity-mapped UEFI pointer;
 /// it is not automatically mapped into the host process.
@@ -106,10 +126,206 @@ pub struct MemoryMapInfo {
     pub entry_count: usize,
 }
 
+const CPUID_TME_ACTIVATE: u32 = 1 << 13;
+const CPUID_AMD_SME: u32 = 1 << 0;
+const CPUID_AMD_SEV: u32 = 1 << 1;
+const AMD_SYSCFG_MEM_ENCRYPTION_ENABLED: u64 = 1 << 23;
+const IA32_TME_ACTIVATE: u32 = 0x982;
+const AMD64_SYSCFG: u32 = 0xC001_0010;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryEncryptionStatus {
+    Unsupported,
+    IntelTme {
+        active: bool,
+        locked: bool,
+        algorithm: u16,
+    },
+    AmdSme {
+        active: bool,
+        sev_supported: bool,
+        c_bit_position: Option<u8>,
+    },
+}
+
+impl MemoryEncryptionStatus {
+    /// Strict deployments require immutable, active TME or active SME with a usable C-bit.
+    pub const fn satisfies_strict_policy(self) -> bool {
+        match self {
+            Self::IntelTme {
+                active,
+                locked,
+                algorithm,
+            } => active && locked && (algorithm == 0 || algorithm == 1),
+            Self::AmdSme {
+                active,
+                c_bit_position,
+                ..
+            } => {
+                active
+                    && matches!(c_bit_position, Some(position) if position >= 12 && position <= 51)
+            }
+            Self::Unsupported => false,
+        }
+    }
+
+    /// The AMD C-bit is applied to RAM page-table entries, never Intel TME mappings.
+    pub const fn amd_c_bit_mask(self) -> Option<u64> {
+        match self {
+            Self::AmdSme {
+                active: true,
+                c_bit_position: Some(position),
+                ..
+            } if position < 64 => Some(1u64 << position),
+            _ => None,
+        }
+    }
+}
+
+#[inline]
+unsafe fn read_msr(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    core::arch::asm!(
+        "rdmsr",
+        in("ecx") msr,
+        out("eax") low,
+        out("edx") high,
+        options(nomem, nostack, preserves_flags),
+    );
+    ((high as u64) << 32) | low as u64
+}
+
+fn decode_intel_tme(activate: u64) -> MemoryEncryptionStatus {
+    MemoryEncryptionStatus::IntelTme {
+        active: activate & (1 << 1) != 0,
+        locked: activate & 1 != 0,
+        algorithm: (activate >> 48) as u16,
+    }
+}
+
+fn decode_amd_sme(
+    sme_supported: bool,
+    sev_supported: bool,
+    sys_cfg: u64,
+    cpuid_ebx: u32,
+) -> MemoryEncryptionStatus {
+    let c_bit = (cpuid_ebx & 0x3f) as u8;
+    MemoryEncryptionStatus::AmdSme {
+        active: sys_cfg & AMD_SYSCFG_MEM_ENCRYPTION_ENABLED != 0,
+        sev_supported,
+        c_bit_position: if sme_supported && (12..=51).contains(&c_bit) {
+            Some(c_bit)
+        } else {
+            None
+        },
+    }
+}
+
+/// Probe hardware transparent memory encryption without touching unsupported MSRs.
+///
+/// RDMSR is issued only after the corresponding architectural CPUID capability
+/// is present and the vendor/leaf range matches. Legacy CPUs and emulators that
+/// do not advertise TME/SME therefore never execute these MSR accesses.
+pub fn memory_encryption_status() -> MemoryEncryptionStatus {
+    let basic = core::arch::x86_64::__cpuid(0);
+    let mut vendor = [0u8; 12];
+    vendor[..4].copy_from_slice(&basic.ebx.to_le_bytes());
+    vendor[4..8].copy_from_slice(&basic.edx.to_le_bytes());
+    vendor[8..].copy_from_slice(&basic.ecx.to_le_bytes());
+    if &vendor == b"GenuineIntel" {
+        if basic.eax < 7 {
+            return MemoryEncryptionStatus::Unsupported;
+        }
+        let leaf7 = core::arch::x86_64::__cpuid_count(7, 0);
+        if leaf7.ecx & CPUID_TME_ACTIVATE == 0 {
+            return MemoryEncryptionStatus::Unsupported;
+        }
+        // Intel documents IA32_TME_ACTIVATE when CPUID.(EAX=7,ECX=0):ECX[13] is set.
+        return decode_intel_tme(unsafe { read_msr(IA32_TME_ACTIVATE) });
+    }
+
+    if &vendor == b"AuthenticAMD" {
+        let extended = core::arch::x86_64::__cpuid(0x8000_0000).eax;
+        if extended < 0x8000_001f {
+            return MemoryEncryptionStatus::Unsupported;
+        }
+        let leaf = core::arch::x86_64::__cpuid(0x8000_001f);
+        let sme_supported = leaf.eax & CPUID_AMD_SME != 0;
+        let sev_supported = leaf.eax & CPUID_AMD_SEV != 0;
+        if !sme_supported && !sev_supported {
+            return MemoryEncryptionStatus::Unsupported;
+        }
+        // AMD exposes SYSCFG.MemEncryptionEnabled when SME/SEV is enumerated.
+        return decode_amd_sme(
+            sme_supported,
+            sev_supported,
+            unsafe { read_msr(AMD64_SYSCFG) },
+            leaf.ebx,
+        );
+    }
+
+    MemoryEncryptionStatus::Unsupported
+}
+
 /// Reports CPU support for the AVX-512 kernel; OS vector state is enabled separately.
 pub fn cpu_supports_avx512() -> bool {
     let (f, bw, dq, vl, xsave, _, _) = avx512_guest_features();
     f && bw && dq && vl && xsave
+}
+
+/// Reports AVX-512F, AVX-512BW, and AVX-512VPOPCNTDQ hardware support.
+pub fn cpu_supports_avx512_vpopcntdq() -> bool {
+    let max_leaf = core::arch::x86_64::__cpuid(0).eax;
+    if max_leaf < 7 {
+        return false;
+    }
+
+    let leaf7 = core::arch::x86_64::__cpuid_count(7, 0);
+    let avx512f = (leaf7.ebx & (1 << 16)) != 0;
+    let avx512bw = (leaf7.ebx & (1 << 30)) != 0;
+    let avx512vpopcntdq = (leaf7.ecx & (1 << 14)) != 0;
+    avx512f && avx512bw && avx512vpopcntdq
+}
+
+/// Reports AVX-512F and XSAVE prerequisites for enabling OS ZMM state.
+/// OSXSAVE may initially be clear; `enable_avx512_os_state` enables it before XGETBV.
+pub fn cpu_supports_avx512_state() -> bool {
+    let (f, _, _, _, xsave, _, _) = avx512_guest_features();
+    f && xsave
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct L3CatCapabilities {
+    pub cbm_length: u8,
+    pub clos_count: u32,
+}
+
+/// Enumerates Intel L3 Cache Allocation Technology without touching CAT MSRs.
+/// MSR access is deferred until after this CPUID capability gate succeeds.
+pub fn l3_cat_capabilities() -> Option<L3CatCapabilities> {
+    let max_leaf = core::arch::x86_64::__cpuid(0).eax;
+    if max_leaf < 0x10 {
+        return None;
+    }
+    let rdt_leaf = core::arch::x86_64::__cpuid_count(7, 0);
+    if rdt_leaf.ebx & (1 << 15) == 0 {
+        return None;
+    }
+    let allocation_leaf = core::arch::x86_64::__cpuid_count(0x10, 0);
+    if allocation_leaf.ebx & (1 << 1) == 0 {
+        return None;
+    }
+    let l3_leaf = core::arch::x86_64::__cpuid_count(0x10, 1);
+    let cbm_length = ((l3_leaf.eax & 0x1F) + 1) as u8;
+    let clos_count = (l3_leaf.ecx & 0xFFFF) + 1;
+    if cbm_length < 2 || clos_count < 2 {
+        return None;
+    }
+    Some(L3CatCapabilities {
+        cbm_length,
+        clos_count,
+    })
 }
 
 /// Returns guest-visible AVX-512 CPUID bits, XSAVE/OSXSAVE, and the current XCR0 value.
@@ -327,5 +543,48 @@ pub unsafe fn hardware_shutdown() -> ! {
     // 4. Halt CPU if still alive
     loop {
         core::arch::asm!("cli; hlt", options(nomem, nostack));
+    }
+}
+
+#[cfg(test)]
+mod memory_encryption_tests {
+    use super::*;
+
+    #[test]
+    fn intel_tme_requires_active_locked_known_algorithm_for_strict_policy() {
+        let active = decode_intel_tme((1 << 48) | (1 << 1) | 1);
+        assert_eq!(
+            active,
+            MemoryEncryptionStatus::IntelTme {
+                active: true,
+                locked: true,
+                algorithm: 1,
+            }
+        );
+        assert!(active.satisfies_strict_policy());
+        assert!(!decode_intel_tme(1 << 1).satisfies_strict_policy());
+        assert!(!decode_intel_tme((3 << 48) | (1 << 1) | 1).satisfies_strict_policy());
+    }
+
+    #[test]
+    fn amd_sme_decodes_status_and_validates_c_bit_position() {
+        let active = decode_amd_sme(true, true, AMD_SYSCFG_MEM_ENCRYPTION_ENABLED, 47);
+        assert_eq!(active.amd_c_bit_mask(), Some(1 << 47));
+        assert!(active.satisfies_strict_policy());
+        assert!(!decode_amd_sme(true, true, 0, 47).satisfies_strict_policy());
+        assert!(
+            !decode_amd_sme(true, false, AMD_SYSCFG_MEM_ENCRYPTION_ENABLED, 63)
+                .satisfies_strict_policy()
+        );
+        assert_eq!(
+            decode_amd_sme(false, true, AMD_SYSCFG_MEM_ENCRYPTION_ENABLED, 47).amd_c_bit_mask(),
+            None
+        );
+    }
+
+    #[test]
+    fn unsupported_hardware_is_not_strictly_accepted() {
+        assert!(!MemoryEncryptionStatus::Unsupported.satisfies_strict_policy());
+        assert_eq!(MemoryEncryptionStatus::Unsupported.amd_c_bit_mask(), None);
     }
 }

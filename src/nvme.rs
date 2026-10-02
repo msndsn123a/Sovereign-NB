@@ -107,6 +107,28 @@ impl NvmeController {
     pub unsafe fn init(pci_dev: &PciDeviceInfo) -> Result<Self, &'static str> {
         let bar0 = pci_dev.bar0_mmio;
 
+        // These statically allocated queues may be reused for a shadow-shard update.
+        core::ptr::write_bytes(
+            core::ptr::addr_of_mut!(ADMIN_SQ).cast::<u8>(),
+            0,
+            core::mem::size_of::<AlignedSq>(),
+        );
+        core::ptr::write_bytes(
+            core::ptr::addr_of_mut!(ADMIN_CQ).cast::<u8>(),
+            0,
+            core::mem::size_of::<AlignedCq>(),
+        );
+        core::ptr::write_bytes(
+            core::ptr::addr_of_mut!(IO_SQ).cast::<u8>(),
+            0,
+            core::mem::size_of::<AlignedSq>(),
+        );
+        core::ptr::write_bytes(
+            core::ptr::addr_of_mut!(IO_CQ).cast::<u8>(),
+            0,
+            core::mem::size_of::<AlignedCq>(),
+        );
+
         // 1. Read Controller Capabilities (CAP) at offset 0x00
         let cap = read_volatile((bar0 as *const u64).add(0));
         let dstrd = ((cap >> 32) & 0x0F) as usize;
@@ -231,6 +253,10 @@ impl NvmeController {
         // CDW11: CQID (bits 31:16) = 1, Physically Contiguous (bit 0 = 1)
         create_sq_cmd.cdw11 = (1 << 16) | 0x0001;
         ctrl.submit_admin_cmd(&create_sq_cmd)?;
+        crate::serial_println!(
+            "[NVMe]: polled SQ/CQ ready; queue_depth={}, interrupts=disabled, doorbells=MMIO",
+            QUEUE_SIZE
+        );
 
         // 8. Identify Namespace 1 to inspect logical block size
         let id_buf = core::ptr::addr_of_mut!(NAMESPACE_IDENTIFY_BUFFER.0) as *mut u8;
@@ -405,5 +431,22 @@ impl NvmeController {
                 return Err("Timeout waiting for NVMe Read DMA completion");
             }
         }
+    }
+
+    /// Read contiguous namespace blocks directly into a caller-owned DMA buffer.
+    /// The I/O SQ doorbell is rung via MMIO and completion is polled without interrupts.
+    ///
+    /// # Safety
+    /// `dest_buffer` must be physically contiguous, identity-mapped, and 4 KiB aligned.
+    pub unsafe fn read_blocks_polled(
+        &mut self,
+        lba: u64,
+        count: u16,
+        dest_buffer: &mut [u8],
+    ) -> Result<usize, &'static str> {
+        self.read_raw_lba(lba, count, dest_buffer.as_mut_ptr(), dest_buffer.len())?;
+        (count as usize)
+            .checked_mul(self.logical_block_size)
+            .ok_or("NVMe polled read byte-count overflow")
     }
 }

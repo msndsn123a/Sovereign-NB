@@ -1,7 +1,12 @@
 [package]
-name = "payload_builder"
+name = "onnx2neur"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

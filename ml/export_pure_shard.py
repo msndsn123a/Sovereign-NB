@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 import struct
 from pathlib import Path
 
@@ -20,7 +21,8 @@ from train_pure_mlp import (
 )
 
 MAGIC = b"NEUR"
-VERSION = 1
+UNSIGNED_INPUT_VERSION = 1
+VERSION = 2
 QUANT_TERNARY = 0
 HEADER_SIZE = 16
 LAYER1_BYTES = 32 * 16
@@ -68,7 +70,7 @@ def encode_shard(layer1: list[list[int]], layer2: list[list[int]], block_size: i
 
     header = bytearray(HEADER_SIZE)
     header[0:4] = MAGIC
-    struct.pack_into("<I", header, 4, VERSION)
+    struct.pack_into("<I", header, 4, UNSIGNED_INPUT_VERSION)
     struct.pack_into("<I", header, 8, INPUT_DIM)
     header[12] = QUANT_TERNARY
     struct.pack_into("<H", header, 13, OUTPUT_DIM)
@@ -90,7 +92,7 @@ def validate_header_and_size(shard: bytes, block_size: int) -> None:
     output_dim = struct.unpack_from("<H", shard, 13)[0]
     hidden_dim = shard[15]
     if (version, input_dim, hidden_dim, output_dim, quant_type) != (
-        VERSION, INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, QUANT_TERNARY
+        UNSIGNED_INPUT_VERSION, INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, QUANT_TERNARY
     ):
         raise ValueError("NEUR header fields do not match the 64->32->16 ternary format")
     validate_packed(shard[HEADER_SIZE:PAYLOAD_SIZE])
@@ -115,9 +117,10 @@ def main() -> None:
     parser.add_argument("--expected", default="dist/trained_pure_mlp_expected.json")
     parser.add_argument("--block-size", type=int, default=512, choices=(512, 4096))
     parser.add_argument("--version", type=int, default=VERSION)
+    parser.add_argument("--key-file", help="optional raw 32-byte Ed25519 seed file")
     args = parser.parse_args()
     if args.version != VERSION:
-        raise ValueError("this firmware accepts NEUR version 1")
+        raise ValueError("this exporter emits signed NEUR version 2")
 
     checkpoint_path = Path(args.checkpoint)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
@@ -127,7 +130,7 @@ def main() -> None:
 
     layer1 = quantized_int8(model.layer1.weight)
     layer2 = quantized_int8(model.layer2.weight)
-    shard = encode_shard(layer1, layer2, args.block_size)
+    unsigned_shard = encode_shard(layer1, layer2, args.block_size)
 
     # Deterministic signed-int8 batch, serialized for frame-by-frame QEMU comparison.
     test_batch = [
@@ -144,25 +147,47 @@ def main() -> None:
             "quantized PyTorch forward pass differs from exact integer ternary reference: "
             f"torch={expected_batch}, integer={integer_reference}"
         )
+    output_path = Path(args.output)
+    expected_path = Path(args.expected)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    expected_path.parent.mkdir(parents=True, exist_ok=True)
+    unsigned_path = output_path.with_suffix(output_path.suffix + ".unsigned")
+    unsigned_path.write_bytes(unsigned_shard)
+    repo_root = Path(__file__).resolve().parent.parent
+    rustc = subprocess.run(
+        ["rustc", "-vV"], check=True, capture_output=True, text=True, cwd=repo_root
+    ).stdout
+    host = next(line.split(":", 1)[1].strip() for line in rustc.splitlines() if line.startswith("host:"))
+    sign_command = [
+        "cargo", "run", "--manifest-path", "tools/payload_builder/Cargo.toml",
+        "--target", host, "--release", "--", "--unsigned-input", str(unsigned_path),
+        "--output", str(output_path), "--block-size", str(args.block_size),
+    ]
+    if args.key_file:
+        sign_command.extend(("--key-file", args.key_file))
+    try:
+        subprocess.run(sign_command, check=True, cwd=repo_root)
+    finally:
+        unsigned_path.unlink(missing_ok=True)
+    shard = output_path.read_bytes()
+    if len(shard) % args.block_size or len(shard) < 80 + LAYER1_BYTES + LAYER2_BYTES:
+        raise ValueError("signed NEUR v2 shard has invalid size")
+    signed_version = struct.unpack_from("<I", shard, 4)[0]
+    if shard[:4] != MAGIC or signed_version != 2:
+        raise ValueError("signer did not produce a NEUR v2 shard")
     expected = {
         "test_batch_i8": test_batch,
         "test_batch_output_i32": expected_batch,
         "dimensions": {"input": INPUT_DIM, "hidden": HIDDEN_DIM, "output": OUTPUT_DIM},
         "shard_sha256": hashlib.sha256(shard).hexdigest(),
     }
-
-    output_path = Path(args.output)
-    expected_path = Path(args.expected)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    expected_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(shard)
     expected_path.write_text(json.dumps(expected, indent=2) + "\n", encoding="utf-8")
 
     print(
-        "[SHARD EXPORT]: magic=NEUR version=1 input_dim=64 hidden_dim=32 output_dim=16 quant_type=0"
+        "[SHARD EXPORT]: magic=NEUR version=2 input_dim=64 hidden_dim=32 output_dim=16 quant_type=0 signature=Ed25519"
     )
     print(f"[SHARD EXPORT]: layer1={LAYER1_BYTES} bytes layer2={LAYER2_BYTES} bytes")
-    print(f"[SHARD EXPORT]: payload={PAYLOAD_SIZE} bytes padded_size={len(shard)} block_size={args.block_size}")
+    print(f"[SHARD EXPORT]: unsigned_payload={PAYLOAD_SIZE - HEADER_SIZE} bytes signed_header=80 bytes padded_size={len(shard)} block_size={args.block_size}")
     print(f"[SHARD EXPORT]: sha256={expected['shard_sha256']}")
     print(f"[SHARD EXPORT]: shard={output_path} expected={expected_path}")
     print(

@@ -6,10 +6,12 @@ edition = "2021"
 [dependencies]
 uefi = { version = "0.31", default-features = false }
 uefi-raw = { version = "0.7", default-features = false }
+ed25519-dalek = { version = "2.2", default-features = false }
 
 [features]
 default = []
 host-ipc = []
+strict-memory-encryption = []
 
 [profile.dev]
 panic = "abort"

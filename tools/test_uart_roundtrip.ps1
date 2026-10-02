@@ -25,18 +25,19 @@ try {
     }
 
     $shardBytes = [System.IO.File]::ReadAllBytes((Resolve-Path $ShardPath))
-    if ($shardBytes.Length -lt 16 -or [System.Text.Encoding]::ASCII.GetString($shardBytes, 0, 4) -ne "NEUR") {
-        throw "Shard does not contain a NEUR header"
+    if ($shardBytes.Length -lt 720 -or [System.Text.Encoding]::ASCII.GetString($shardBytes, 0, 4) -ne "NEUR") {
+        throw "Shard does not contain a complete signed NEUR v2 header/payload"
     }
+    $version = [BitConverter]::ToUInt32($shardBytes, 4)
     $inputDim = [BitConverter]::ToUInt32($shardBytes, 8)
     $quantType = $shardBytes[12]
     $outputDim = [BitConverter]::ToUInt16($shardBytes, 13)
     $hiddenDim = $shardBytes[15]
-    if ($inputDim -ne 64 -or $hiddenDim -ne 32 -or $outputDim -ne 16 -or $quantType -ne 0) {
-        throw "Shard header is not the supported 64->32->16 ternary MLP"
+    if ($version -ne 2 -or $inputDim -ne 64 -or $hiddenDim -ne 32 -or $outputDim -ne 16 -or $quantType -ne 0) {
+        throw "Shard header is not the supported signed v2 64->32->16 ternary MLP"
     }
-    if ($shardBytes.Length -lt 656) {
-        throw "Dual-layer shard is truncated; expected at least 656 bytes"
+    if ($shardBytes.Length -lt 720) {
+        throw "Signed dual-layer shard is truncated; expected at least 720 bytes"
     }
     $expected = Get-Content -Raw -Path $ExpectedPath | ConvertFrom-Json
     $testInputs = @($expected.test_batch_i8)
@@ -176,7 +177,7 @@ try {
         throw "QEMU did not exit after the configured one-frame limit"
     }
     if (Test-Path $serialLog) {
-        $telemetry = Select-String -Path $serialLog -Pattern "\[GUEST CPUID\]:|\[SIMD\]:|\[SHM\]: Initialized Mailbox|\[MLP VERIFY\]|\[SHARD\]: MAGIC|\[SHARD\]: Layer [12]|\[ALLOC\]:|\[LATENCY\]: shared_mailbox_|\[TIMER\]: Calibrated TSC frequency|\[TIMER\]: Invariant|\[TIMER WARNING\]|\[CPU POWER\]|\[LATENCY\]:|\[UART\]: RX frames=$($testInputs.Count), TX frames=$($testInputs.Count)|\[RING\]: Atomic SPSC"
+        $telemetry = Select-String -Path $serialLog -Pattern "\[GUEST CPUID\]:|\[SIMD\]:|\[SHM\]: Initialized Mailbox|\[MLP VERIFY\]|\[SHARD\]: MAGIC|\[SHARD\]: Layer [12]|\[SECURITY\]: Shard signature valid|\[ALLOC\]:|\[LATENCY\]: shared_mailbox_|\[TIMER\]: Calibrated TSC frequency|\[TIMER\]: Invariant|\[TIMER WARNING\]|\[CPU POWER\]|\[LATENCY\]:|\[UART\]: RX frames=$($testInputs.Count), TX frames=$($testInputs.Count)|\[RING\]: Atomic SPSC"
         $telemetry | ForEach-Object { Write-Host $_.Line }
         if (-not ($telemetry.Line -match "\[SHM\]: Initialized Mailbox at physical addr .*alignment=64")) {
             throw "COM1 log did not confirm an aligned shared mailbox allocation"
@@ -184,8 +185,11 @@ try {
         if (-not ($telemetry.Line -match "\[MLP VERIFY\]: Layer1=64->32, hard_sign=32, Layer2=32->16; frames=16, drops=0, scalar_reference=match")) {
             throw "COM1 log did not confirm dual-layer scalar-reference parity and zero drops"
         }
-        if (-not ($telemetry.Line -match "\[SHARD\]: MAGIC=0x4E455552, VERSION=1, INPUT_DIM=64, HIDDEN_DIM=32, OUTPUT_DIM=16, QUANT_TYPE=0")) {
-            throw "COM1 log did not confirm the dual-layer NEUR header dimensions"
+        if (-not ($telemetry.Line -match "\[SHARD\]: MAGIC=0x4E455552, VERSION=2, INPUT_DIM=64, MODEL_TYPE=0, HIDDEN_OR_ATTN_DIM=32, OUTPUT_DIM=16")) {
+            throw "COM1 log did not confirm the signed v2 NEUR header dimensions"
+        }
+        if (-not ($telemetry.Line -match "\[SECURITY\]: Shard signature valid \(Ed25519 verified\)")) {
+            throw "COM1 log did not confirm Ed25519 shard authentication"
         }
         if (-not ($telemetry.Line -match "\[SHARD\]: Layer 1: 64 -> 32") -or -not ($telemetry.Line -match "\[SHARD\]: Layer 2: 32 -> 16")) {
             throw "COM1 log did not report both dual-layer dimensions"

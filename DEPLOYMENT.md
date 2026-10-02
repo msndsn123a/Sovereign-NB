@@ -120,6 +120,36 @@ Before booting the appliance, ensure the target motherboard firmware is configur
 | **C-States / P-States** | `Disabled / Maximum Performance` | Guarantees zero latency spikes and fixed CPU clock |
 | **Hyper-Threading** | `Disabled` (Optional) | Recommended for deterministic single-core sovereignty |
 
+### Hardware Memory Encryption Policy (TME / SME)
+
+At startup, COM1 reports Intel TME or AMD SME only after the CPU vendor and
+CPUID capability bits advertise the corresponding MSRs. Unsupported or
+virtualized CPUs report `[SECURITY MEM]: Hardware encryption unsupported /
+inactive (virtualized/legacy)` without attempting an unsupported `RDMSR`.
+AMD SME's CPUID-provided C-bit is applied to non-MMIO identity-map huge pages;
+MMIO mappings remain unencrypted and uncached. Intel TME is transparent to the
+page-table format.
+
+Mission-critical builds can make hardware encryption mandatory with the
+compile-time Cargo policy feature:
+
+```powershell
+cargo +nightly build --features strict-memory-encryption --target x86_64-unknown-uefi --release
+```
+
+Strict mode refuses boot before model loading or DMA setup unless Intel TME is
+active, locked, and reports a recognized AES-XTS algorithm, or AMD SME is active
+with a valid C-bit position. The default build reports status but allows
+virtualized/legacy hardware for development and QEMU regression tests.
+
+Expected security records include:
+
+```text
+[SECURITY TME]: Intel TME active (AES-XTS-128, locked=true)
+[SECURITY SME]: AMD SME active (encrypted DRAM, C-bit=47, SEV supported=false)
+[SECURITY MEM]: Hardware encryption unsupported / inactive (virtualized/legacy)
+```
+
 ---
 
 ## 6. Remote Telemetry Capture (Serial-Over-LAN)

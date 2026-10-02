@@ -1,0 +1,59 @@
+name: Deploy Wasm Playground to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tools/wasm_verifier/**"
+      - "src/activation.rs"
+      - "src/kernel.rs"
+      - "src/main.rs"
+      - "src/neon_kernel.rs"
+      - "rust-toolchain.toml"
+      - "Cargo.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install nightly Rust and Wasm target
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Build no-std Wasm verifier
+        run: cargo +nightly build --locked --manifest-path tools/wasm_verifier/Cargo.toml --no-default-features --target wasm32-unknown-unknown --release
+
+      - name: Stage GitHub Pages site
+        run: |
+          mkdir -p _site
+          cp tools/wasm_verifier/index.html _site/index.html
+          cp tools/wasm_verifier/target/wasm32-unknown-unknown/release/wasm_verifier.wasm _site/wasm_verifier.wasm
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

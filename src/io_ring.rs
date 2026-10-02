@@ -12,6 +12,7 @@ pub struct InputFrame {
     pub payload: [i8; 64],
     pub t0_preamble: u64,
     pub t1_ingress: u64,
+    pub stream_id: u8,
 }
 
 #[repr(C, align(64))]
@@ -58,6 +59,16 @@ impl<T: Copy> SpscRing<T> {
 
     pub fn split(&mut self) -> (Producer<'_, T>, Consumer<'_, T>) {
         (Producer { ring: self }, Consumer { ring: self })
+    }
+
+    /// Snapshot queue cursors through a raw pointer without creating an aliasing reference.
+    ///
+    /// # Safety
+    /// `ring` must point to a live `SpscRing<T>` for the duration of the atomic reads.
+    pub unsafe fn snapshot_raw(ring: *const Self) -> (usize, usize) {
+        let head = (*ring).head.load(Ordering::Acquire);
+        let tail = (*ring).tail.load(Ordering::Acquire);
+        (head, tail)
     }
 }
 

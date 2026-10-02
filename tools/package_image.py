@@ -5,6 +5,7 @@ import argparse
 import math
 import os
 import struct
+import subprocess
 import uuid
 import zlib
 
@@ -13,19 +14,24 @@ PARTITION_SECTORS = 131_072  # 64 MiB; enough clusters for a standards-compliant
 ESP_START_LBA = 2048
 DATA_START_LBA = ESP_START_LBA + PARTITION_SECTORS
 TOTAL_SECTORS = DATA_START_LBA + PARTITION_SECTORS + 2048
+HOT_SWAP_LBA = DATA_START_LBA + PARTITION_SECTORS
 FAT32_RESERVED_SECTORS = 32
 FAT_COUNT = 2
 
 
-def default_model_shard():
-    """Produce a minimal valid all-zero 64->32->16 ternary MLP shard."""
-    shard = bytearray(1024)
-    shard[0:4] = b"NEUR"
-    struct.pack_into("<II", shard, 4, 1, 64)
-    shard[12] = 0
-    struct.pack_into("<H", shard, 13, 16)
-    shard[15] = 32
-    return bytes(shard)
+def generate_signed_default_shard(shard_path):
+    """Generate a signed default shard with the Rust test-key signer."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    rustc = subprocess.run(
+        ["rustc", "-vV"], check=True, capture_output=True, text=True, cwd=repo_root
+    ).stdout
+    host = next(line.split(":", 1)[1].strip() for line in rustc.splitlines() if line.startswith("host:"))
+    command = [
+        "cargo", "run", "--manifest-path", "tools/payload_builder/Cargo.toml",
+        "--target", host, "--release", "--", "--model", "mlp", "--output", shard_path,
+    ]
+    os.makedirs(os.path.dirname(shard_path) or ".", exist_ok=True)
+    subprocess.run(command, check=True, cwd=repo_root)
 
 
 def fat32_format(disk, start_lba, sector_count, volume_label, volume_id, files, esp=False):
@@ -232,6 +238,7 @@ def package_appliance_image(
     efi_path="target/x86_64-unknown-uefi/release/neural_box_core.efi",
     shard_path="dist/production_shard.bin",
     out_path="dist/neural_box_appliance.img",
+    hot_swap_shard_path=None,
 ):
     if not os.path.exists(efi_path):
         fallback_efi = "esp/EFI/BOOT/BOOTX64.EFI"
@@ -242,16 +249,24 @@ def package_appliance_image(
     with open(efi_path, "rb") as file:
         efi_bytes = file.read()
 
+    shard_bytes = b""
     if os.path.exists(shard_path):
         with open(shard_path, "rb") as file:
             shard_bytes = file.read()
-        print(f"[PACKAGE_IMAGE]: Using model shard {shard_path} ({len(shard_bytes)} bytes)")
-    else:
-        shard_bytes = default_model_shard()
-        os.makedirs(os.path.dirname(shard_path) or ".", exist_ok=True)
-        with open(shard_path, "wb") as file:
-            file.write(shard_bytes)
-        print(f"[PACKAGE_IMAGE]: Generated default valid MLP shard at {shard_path}")
+    if (
+        len(shard_bytes) < 80
+        or shard_bytes[:4] != b"NEUR"
+        or struct.unpack_from("<I", shard_bytes, 4)[0] != 2
+    ):
+        if os.path.normcase(os.path.normpath(shard_path)) != os.path.normcase(
+            os.path.normpath("dist/production_shard.bin")
+        ):
+            raise ValueError("custom shard is unsigned/legacy; provide a signed NEUR v2 shard")
+        print("[PACKAGE_IMAGE]: Legacy/unsigned default shard found; generating signed NEUR v2 default")
+        generate_signed_default_shard(shard_path)
+        with open(shard_path, "rb") as file:
+            shard_bytes = file.read()
+    print(f"[PACKAGE_IMAGE]: Using signed NEUR v2 shard {shard_path} ({len(shard_bytes)} bytes)")
 
     disk = bytearray(TOTAL_SECTORS * SECTOR_SIZE)
     startup_script = b"fs0:\r\n\\EFI\\BOOT\\BOOTX64.EFI\r\n"
@@ -264,6 +279,19 @@ def package_appliance_image(
         {"weights.bin": shard_bytes},
     )
     write_gpt(disk)
+
+    if hot_swap_shard_path:
+        with open(hot_swap_shard_path, "rb") as file:
+            update_shard = file.read()
+        backup_entries_lba = TOTAL_SECTORS - 1 - 32
+        available_bytes = (backup_entries_lba - HOT_SWAP_LBA) * SECTOR_SIZE
+        if len(update_shard) > available_bytes:
+            raise ValueError("hot-swap shard exceeds the reserved raw-NVMe region")
+        hot_swap_offset = HOT_SWAP_LBA * SECTOR_SIZE
+        disk[hot_swap_offset:hot_swap_offset + len(update_shard)] = update_shard
+        print(
+            f"[PACKAGE_IMAGE]: Hot-swap shard {hot_swap_shard_path} written at raw LBA {HOT_SWAP_LBA} ({len(update_shard)} bytes)"
+        )
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "wb") as file:
@@ -283,8 +311,9 @@ def main():
     parser.add_argument("--efi-path", default="target/x86_64-unknown-uefi/release/neural_box_core.efi")
     parser.add_argument("--shard-path", default="dist/production_shard.bin")
     parser.add_argument("--output", default="dist/neural_box_appliance.img")
+    parser.add_argument("--hot-swap-shard", help="signed shard to place in the reserved raw-NVMe update region")
     args = parser.parse_args()
-    package_appliance_image(args.efi_path, args.shard_path, args.output)
+    package_appliance_image(args.efi_path, args.shard_path, args.output, args.hot_swap_shard)
 
 
 if __name__ == "__main__":
