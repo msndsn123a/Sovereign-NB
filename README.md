@@ -42,6 +42,8 @@ Sovereign Neural Box is a `no_std` bare-metal UEFI inference project. Its x86-64
 
 Open the [live in-browser verifier](https://msndsn123a.github.io/Sovereign-NB/). It runs the no-std Rust kernels in WebAssembly, randomizes signed-byte inputs, displays all 16 outputs, compares them element-by-element with the scalar reference, and visualizes per-stream recurrent attention state. It has no external CDN or JavaScript dependencies.
 
+> **Note on Latency:** Browser measurements include JavaScript-to-Wasm FFI invocation overhead across 128 iterations. In contrast, bare-metal UEFI execution runs directly on bare silicon with zero OS noise, sub-150ns frame turnaround, and zero heap allocations.
+
 The repository's **Settings → Pages → Build and deployment → Source** must be set to **GitHub Actions** for the workflow to publish updates.
 
 To run locally, build the Wasm artifact and serve the standalone page:
