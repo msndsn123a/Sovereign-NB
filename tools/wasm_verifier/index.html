@@ -87,6 +87,14 @@
     .attention-output code { color: #d6e6f5; font: 10px var(--mono); text-align: right; overflow-wrap: anywhere; }
     .suite-footer { color: var(--muted); font-size: 10px; margin: 15px 2px 0; }
     .suite-footer code { color: #c2d6ed; }
+    .execution-context { margin-top: 24px; padding: 16px; border: 1px solid #303d52; border-radius: 10px; background: #111b2a; color: #c9d5e3; font-size: 12px; line-height: 1.6; }
+    .execution-context h2 { margin: 0 0 8px; color: #70b8ff; font-size: 14px; }
+    .execution-context p { margin: 0 0 10px; }
+    .execution-context h3 { margin: 0 0 7px; color: #dce9f8; font-size: 12px; }
+    .execution-context ul { margin: 0; padding-left: 20px; color: #a7b7ca; }
+    .execution-context li { margin: 4px 0; }
+    .execution-context code { color: #b9dcff; font-family: var(--mono); }
+    .execution-context .caveat { margin: 10px 0 0; color: #90a2b8; font-size: 11px; }
     @keyframes badge-pop { 0% { transform: scale(.93); } 65% { transform: scale(1.06); } 100% { transform: scale(1); } }
     @keyframes blink { to { opacity: .35; } }
     @keyframes cell-flash { 0% { transform: scale(.88); filter: brightness(1.9); } 100% { transform: scale(1); filter: brightness(1); } }
@@ -116,7 +124,6 @@
     <div class="metric"><div class="metric-label">Exact output elements</div><div class="metric-value"><span id="exact-count">—</span> <small>/ 16</small></div></div>
     <div class="metric"><div class="metric-label">Selected recurrent stream</div><div class="metric-value"><span id="active-stream">0</span> <small>of 8</small></div></div>
   </section>
-  <div class="latency-footnote"><p style="font-size: 0.8rem; color: #888; margin-top: 6px; line-height: 1.4;">⚡ <strong>Architectural Note:</strong> Measured browser latency reflects JS/Wasm FFI boundary transitions and browser sandboxing across a 128-iteration loop (~300ns/pass). Bare-metal execution on silicon under custom 1 GiB CR3 paging achieves sub-150ns cycle-deterministic execution.</p></div>
 
   <div class="grid-two">
     <section class="panel">
@@ -135,6 +142,19 @@
     <div id="suite-results" class="suite-results" aria-live="polite"></div>
     <p class="suite-footer">The reference uses the same packed ternary model and shared integer scalar semantics as the UEFI kernel. No floating-point inference or external scripts are used.</p>
   </section>
+
+  <aside class="execution-context" aria-labelledby="execution-context-title">
+    <h2 id="execution-context-title">🖥️ Execution Context &amp; Hardware Profile</h2>
+    <p><strong>Where is this running?</strong> The verifier executes on <strong>your local machine’s CPU</strong> inside the browser’s WebAssembly sandbox. The latency metric above is the average of 128 complete Wasm MLP calls, timed with <code>performance.now()</code>; it includes browser, sandbox, and JavaScript/Wasm boundary overhead and varies by CPU and browser. It is <strong>not a bare-metal latency measurement</strong>, and does not establish a 40–100 ns raw-pass result.</p>
+    <h3>Peak Bare-Metal Performance Profile · sub-150 ns is a platform-dependent target</h3>
+    <ul>
+      <li><strong>CPU architecture:</strong> x86-64 with AVX-512 and <code>VPOPCNTDQ</code> (for example, supported Intel Xeon or AMD Zen 4+ CPUs), or ARM64 with NEON SIMD.</li>
+      <li><strong>Cache and memory:</strong> Intel L3 CAT or a platform QoS equivalent for cache-way partitioning; 1 GiB huge-page support to reduce TLB pressure.</li>
+      <li><strong>Firmware and storage:</strong> UEFI boot directly on physical hardware through <code>ExitBootServices</code>, plus polled-mode NVMe over a PCIe MMIO BAR.</li>
+      <li><strong>Power and timing:</strong> x86 <code>UMONITOR</code>/<code>UMWAIT</code> support for C0.2 waits and an invariant TSC. Other architectures use their own architected counters and wait mechanisms.</li>
+    </ul>
+    <p class="caveat">These capabilities are optional or architecture-specific. CAT partitions cache allocation but does not pin data or guarantee zero DRAM stalls; huge pages reduce TLB pressure but do not eliminate every TLB miss. The AArch64 target currently validates its NEON kernel and UEFI boot path, not the complete x86 appliance runtime.</p>
+  </aside>
 
   <section class="panel">
     <div class="panel-heading attention-top"><div><h2>Recurrent attention · live state</h2><p class="panel-subtitle">Each selected token updates its stream-local 16 × 16 integer memory</p></div><label class="stream-control" for="stream-select">STREAM<select id="stream-select" aria-label="Select recurrent attention stream"></select></label></div>

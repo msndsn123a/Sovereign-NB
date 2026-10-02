@@ -42,9 +42,22 @@ Sovereign Neural Box is a `no_std` bare-metal UEFI inference project. Its x86-64
 
 Open the [live in-browser verifier](https://msndsn123a.github.io/Sovereign-NB/). It runs the no-std Rust kernels in WebAssembly, randomizes signed-byte inputs, displays all 16 outputs, compares them element-by-element with the scalar reference, and visualizes per-stream recurrent attention state. It has no external CDN or JavaScript dependencies.
 
-> **Note on Latency:** Browser measurements include JavaScript-to-Wasm FFI invocation overhead across 128 iterations. In contrast, bare-metal UEFI execution runs directly on bare silicon with zero OS noise, sub-150ns frame turnaround, and zero heap allocations.
-
 The repository's **Settings → Pages → Build and deployment → Source** must be set to **GitHub Actions** for the workflow to publish updates.
+
+### Hardware Requirements for Peak Bare-Metal Performance
+
+The [Interactive WebAssembly Playground](https://msndsn123a.github.io/Sovereign-NB/) runs on your own machine's CPU inside a sandboxed browser runtime. Its latency figure is a browser-measured average of complete Wasm calls; it includes sandbox and JS/Wasm boundary overhead and does not demonstrate bare-metal performance. Sovereign-NB's sub-150 ns figure is a platform-dependent bare-metal target, not a guarantee from the browser demo.
+
+| Feature | Bare-Metal Requirement | Purpose in Sovereign-NB |
+| :--- | :--- | :--- |
+| **Vector Extension** | x86-64 AVX-512 (`VPOPCNTDQ`) / ARM64 NEON | Bit-parallel ternary inner products; NEON validation kernel and integer inference math. |
+| **Cache Control** | Intel CAT (L3 cache masking); AMD QoS is platform-dependent | Partition cache ways for inference data to reduce interference; CAT does not lock lines in L3. |
+| **Memory Management** | x86 1 GiB huge pages and custom `CR3` identity map | Larger mappings reduce TLB pressure after `ExitBootServices`; they do not guarantee zero TLB misses. AArch64 retains firmware mappings. |
+| **Power States** | x86 `UMWAIT` / `UMONITOR` (C0.2) and invariant TSC | Bounded low-power waits and cycle timing for ingress events. Other architectures use their architected counters. |
+| **Physical Security** | Intel TME / AMD SME (`C-bit`) where supported | Transparent memory encryption to mitigate physical memory-bus inspection. |
+| **Storage I/O** | Polled-mode NVMe over PCIe MMIO | Bounded shard reads and shadow-buffer hot-swapping without stopping inference ingress. |
+
+Actual latency depends on CPU, firmware, memory configuration, thermals, and workload; the hardware list describes capabilities used by the bare-metal paths, not a certification or unconditional performance promise.
 
 To run locally, build the Wasm artifact and serve the standalone page:
 
